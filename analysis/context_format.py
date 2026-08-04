@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.4.0
+# Version: 1.5.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -200,7 +200,10 @@ def _get_segments(text: str) -> list[str]:
         if l.startswith("-"):
             segs.extend(DASH_PREFIX.sub("", p).strip() for p in re.split(r"\s+-", l) if p.strip())
         else:
-            segs.append(l)
+            if segs:
+                segs[-1] = f"{segs[-1]} {l}"
+            else:
+                segs.append(l)
     return segs or [clean_txt]
 
 
