@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.3.0
+# Version: 1.4.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -88,6 +88,7 @@ class SdhEntry:
     text: str
     time: int
     speaker: str | None = None
+    manner: str | None = None
 
 
 def strip_tags(text: str) -> str:
@@ -105,16 +106,21 @@ def _strip_line(raw: str) -> str:
     return DASH_PREFIX.sub("", line).strip()
 
 
+def _bracket_closed(line: str) -> bool:
+    close = BRACKET_PAIRS.get(line[:1])
+    return bool(close) and (line.endswith(close) or line.endswith(f"{close}:"))
+
+
 def _merge_bracket_continuations(lines: list[str]) -> list[str]:
     merged, opener, buffer = [], None, None
     for line in lines:
         if buffer is not None:
             buffer = f"{buffer} {line}"
-            if line.endswith(BRACKET_PAIRS[opener]):
+            if line.endswith(BRACKET_PAIRS[opener]) or line.endswith(f"{BRACKET_PAIRS[opener]}:"):
                 merged.append(buffer)
                 buffer, opener = None, None
             continue
-        if line[:1] in BRACKET_PAIRS and not line.endswith(BRACKET_PAIRS[line[0]]):
+        if line[:1] in BRACKET_PAIRS and not _bracket_closed(line):
             opener, buffer = line[0], line
         else:
             merged.append(line)
@@ -132,8 +138,32 @@ def _is_narrator_prefix(pre: str) -> bool:
 
 def _classify(line: str, time: int) -> SdhEntry:
     close = BRACKET_PAIRS.get(line[:1])
-    if close and line.endswith(close) and len(line) > 2:
-        return SdhEntry("sfx", line[1:-1].strip(), time)
+    if close:
+        depth, contents, buf, valid, expected = 0, [], [], True, ""
+        for i, c in enumerate(line):
+            if depth == 0 and c in BRACKET_PAIRS:
+                expected = BRACKET_PAIRS[c]
+                depth += 1
+            elif depth > 0 and c == expected:
+                depth -= 1
+                if depth == 0:
+                    val = "".join(buf).strip()
+                    if val:
+                        contents.append(val)
+                    buf.clear()
+                else:
+                    buf.append(c)
+            elif depth > 0:
+                if c in BRACKET_PAIRS and BRACKET_PAIRS[c] == expected:
+                    depth += 1
+                buf.append(c)
+            elif not c.isspace():
+                if c == ":" and i == len(line) - 1 and len(contents) == 1:
+                    return SdhEntry("manner", contents[0].lower(), time)
+                valid = False
+                break
+        if valid and depth == 0 and contents and not line.endswith(":"):
+            return SdhEntry("sfx", "; ".join(contents), time)
     if line[:1] == "?" and line.endswith("?") and len(line) > 2:
         return SdhEntry("sfx", line[1:-1].strip(), time)
     speaker = SPEAKER_LINE.match(line)
@@ -150,8 +180,14 @@ def extract_entries(sdh_cues: list[Cue]) -> list[SdhEntry]:
     for cue in sdh_cues:
         lines = [_strip_line(raw) for raw in cue.text.split("\n")]
         lines = [line for line in lines if line]
+        pending_manner = None
         for line in _merge_bracket_continuations(lines):
             entry = _classify(line, cue.start)
+            if entry.kind == "manner":
+                pending_manner = entry.text
+                continue
+            if entry.kind == "dialogue" and pending_manner:
+                entry.manner, pending_manner = pending_manner, None
             if entry.text:
                 entries.append(entry)
     return entries
@@ -185,7 +221,7 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
         sdh_owner.extend([pos] * len(words))
 
     matcher = SequenceMatcher(None, clean_tokens, sdh_tokens, autojunk=True)
-    dialogue_clean, total_segs_map, speaker_map = {}, {}, defaultdict(dict)
+    dialogue_clean, total_segs_map, speaker_map, manner_map = {}, {}, defaultdict(dict), {}
     mapped_cues = set()
 
     for block in matcher.get_matching_blocks():
@@ -198,6 +234,8 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
             total_segs_map[ci] = t_segs
             if entries[pos].speaker:
                 speaker_map[ci][s_idx] = entries[pos].speaker
+            if entries[pos].manner:
+                manner_map[ci] = entries[pos].manner
 
     unmatched = sum(
         1 for ci, cue in enumerate(clean_cues)
@@ -206,7 +244,7 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
     )
 
     logger.info("cues mapped: %d/%d, unmatched high-confidence cues: %d", len(mapped_cues), len(clean_cues), unmatched)
-    return dialogue_clean, speaker_map, total_segs_map
+    return dialogue_clean, speaker_map, manner_map, total_segs_map
 
 
 
@@ -231,8 +269,10 @@ def _collapse_sfx(items: list[str], edge_keep: int) -> str:
     return "; ".join(deduped)
 
 
-def _wrap(cue: Cue, seg_speakers: dict[int, str], total_segs: int, width: int = 4) -> str:
+def _wrap(cue: Cue, seg_speakers: dict[int, str], manner: str | None, total_segs: int, width: int = 4) -> str:
     attrs = [f's="{seg_speakers[1]}"'] if total_segs <= 1 and 1 in seg_speakers else [f's{k}="{v}"' for k, v in sorted(seg_speakers.items())]
+    if manner:
+        attrs.append(f'm="{manner}"')
     attr_str = "".join(f" {a}" for a in attrs)
     text = strip_tags(cue.text.replace("\n", " "))
     return f"<c{cue.index:0{width}d}{attr_str}>{text}</c>"
@@ -247,7 +287,7 @@ def build(
     edge_keep: int = 3,
 ) -> str:
     entries = extract_entries(sdh_cues or [])
-    dialogue_clean, speaker_map, total_segs_map = _match_anchors(clean_cues, entries, min_anchor_words, min_block)
+    dialogue_clean, speaker_map, manner_map, total_segs_map = _match_anchors(clean_cues, entries, min_anchor_words, min_block)
     
     sdh_axis, clean_axis = _anchor_axes(dialogue_clean, entries, clean_cues)
     clean_starts, sfx_by_target = [c.start for c in clean_cues], defaultdict(list)
@@ -274,7 +314,7 @@ def build(
                 lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
         
         t_segs = total_segs_map.get(ci) or len(_get_segments(cue.text))
-        lines.append(_wrap(cue, speaker_map.get(ci, {}), t_segs))
+        lines.append(_wrap(cue, speaker_map.get(ci, {}), manner_map.get(ci), t_segs))
         last_end = cue.end
 
     logger.info(
