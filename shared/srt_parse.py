@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: srt_parse.py
-# Version: 1.0
+# Version: 1.1
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -18,37 +18,26 @@
 # Usage / 用法:
 #    python srt_parse.py input.srt
 #    python srt_parse.py input.srt -o output.json
+#    cat input.srt | python srt_parse.py
 #
-#    The script requires one positional argument (input file path). Use 
-#    -o or --output to save the resulting JSON to a file; otherwise, 
-#    the result is printed to stdout.
-#    脚本需要一个位置参数（输入文件路径）。使用 -o 或 --output 将结果 JSON 
-#    保存到文件；否则，结果将直接输出至标准输出 (stdout)。
+#    input is optional; omit it to read raw SRT text from stdin (CI/action
+#    friendly). Use -o/--output to save the resulting JSON to a file;
+#    otherwise the result is printed to stdout.
+#    input 参数可省略，省略时从 stdin 读取原始 SRT 文本（便于 CI/action 场景）。
+#    使用 -o 或 --output 将结果 JSON 保存到文件；否则输出至标准输出 (stdout)。
 #
 # Output / 输出:
-#    A JSON array of objects. Each object contains:
-#      - index: The sequence number of the cue.
-#      - start: Start time in total milliseconds.
-#      - end: End time in total milliseconds.
-#      - text: The subtitle text content.
-#    一个 JSON 数组。每个对象包含：
-#      - index: 字幕序号。
-#      - start: 开始时间（总毫秒数）。
-#      - end: 结束时间（总毫秒数）。
-#      - text: 字幕文本内容。
+#    stdout: a single JSON object {"success": bool, "cues": [...]}, each
+#    cue containing index/start/end/text (start/end in milliseconds).
+#    stderr: diagnostic logs.
+#    标准输出：单个 JSON 对象 {"success": bool, "cues": [...]}，每条 cue
+#    包含 index/start/end/text（start/end 为毫秒）。
+#    标准错误：诊断日志。
 #
 # Example execution / 执行示例:
 #    $ python srt_parse.py example.srt
 #    INFO srt_parse: parsed 120 cues from example.srt
-#    [
-#      {
-#        "index": 1,
-#        "start": 1000,
-#        "end": 4500,
-#        "text": "Hello, welcome to the video!"
-#      },
-#      ...
-#    ]
+#    {"success": true, "cues": [{"index": 1, "start": 1000, "end": 4500, "text": "Hello, welcome to the video!"}, ...]}
 #
 # Exit codes / 退出码:
 #    0    normal completion / 正常完成
@@ -60,6 +49,7 @@ import argparse
 import json
 import logging
 import re
+import sys
 from dataclasses import asdict, dataclass
 
 logger = logging.getLogger("srt_parse")
@@ -82,9 +72,8 @@ def _to_ms(h: str, m: str, s: str, ms: str) -> int:
     return int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(ms)
 
 
-def parse(path: str) -> list[Cue]:
-    raw = open(path, encoding="utf-8-sig").read()
-    lines = raw.splitlines()
+def parse_content(content: str) -> list[Cue]:
+    lines = content.splitlines()
     cues: list[Cue] = []
     i = 0
     while i < len(lines):
@@ -100,19 +89,26 @@ def parse(path: str) -> list[Cue]:
             text_lines.append(lines[i].rstrip())
             i += 1
         cues.append(Cue(len(cues) + 1, start, end, "\n".join(text_lines)))
-    logger.info("parsed %d cues from %s", len(cues), path)
+    return cues
+
+
+def parse(source: str | None) -> list[Cue]:
+    content = open(source, encoding="utf-8-sig").read() if source else sys.stdin.read()
+    cues = parse_content(content)
+    logger.info("parsed %d cues from %s", len(cues), source or "<stdin>")
     return cues
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser(description="SRT to structured cue list (JSON)")
-    parser.add_argument("input")
+    parser.add_argument("input", nargs="?", help="SRT file path; omit to read raw SRT text from stdin")
     parser.add_argument("-o", "--output")
     args = parser.parse_args()
 
-    cues = [asdict(c) for c in parse(args.input)]
-    payload = json.dumps(cues, ensure_ascii=False, indent=2)
+    cues = parse(args.input)
+    payload = json.dumps({"success": bool(cues), "cues": [asdict(c) for c in cues]}, ensure_ascii=False)
+
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(payload)
