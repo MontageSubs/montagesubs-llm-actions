@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.6.0
+# Version: 1.7.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -18,32 +18,38 @@
 #
 # Usage / 用法:
 #    python context_format.py --source clean.srt --sdh sdh.srt
-#    python context_format.py --source clean.srt --sdh sdh.srt -o result.xml
+#    python context_format.py --source clean.srt --sdh sdh.srt -o result.json
+#    echo '{"source": "...", "sdh": "..."}' | python context_format.py
 #
-#    Required: --source (Path to clean SRT). 
-#    Optional: --sdh (Path to SDH SRT), -o (Output file), 
-#    --gap-threshold (Seconds to trigger <gap> tag).
-#    必须参数：--source（纯净 SRT 路径）。
-#    可选参数：--sdh（SDH 版 SRT 路径）、-o（输出文件）、
-#    --gap-threshold（触发 <gap> 标签的时间间隔秒数）。
+#    File mode: --source (path to clean SRT), optional --sdh (path to SDH SRT).
+#    Stdin mode (for action/pipeline chaining, no temp files needed): omit
+#    --source and pipe a JSON object {"source": "<raw srt text>",
+#    "sdh": "<raw srt text or omitted>"} via stdin.
+#    Optional: -o (output file), --gap-threshold (seconds to trigger <gap>).
+#    文件模式：--source（纯净 SRT 路径），可选 --sdh（SDH 版 SRT 路径）。
+#    stdin 模式（便于 action/流水线链式调用，无需落地临时文件）：省略
+#    --source，改为通过 stdin 传入 JSON 对象 {"source": "<原始srt文本>",
+#    "sdh": "<原始srt文本，可省略>"}。
+#    可选参数：-o（输出文件）、--gap-threshold（触发 <gap> 标签的秒数）。
 #
 # Output / 输出:
-#    An XML-formatted sequence containing:
+#    stdout: a single JSON object {"success", "xml", "total_cues",
+#    "mapped_cues", "unmatched_cues"}. "xml" holds the tagged sequence:
 #      - <sfx>...</sfx>: Sound effects found in SDH before the cue.
 #      - <c0000 speaker="...">...</c>: Dialogue with mapped speaker info.
 #      - <gap sec="..."/>: Time gaps exceeding the threshold.
-#    一个 XML 格式的序列，包含：
+#    stderr: diagnostic logs.
+#    标准输出：单个 JSON 对象 {"success", "xml", "total_cues", "mapped_cues",
+#    "unmatched_cues"}，"xml" 字段为标签化序列：
 #      - <sfx>...</sfx>：该条字幕前在 SDH 中出现的音效。
 #      - <c0000 speaker="...">...</c>：映射了说话人信息的对话。
 #      - <gap sec="..."/>：超过阈值的时间间隔。
+#    标准错误：诊断日志。
 #
 # Example execution / 执行示例:
 #    $ python context_format.py --source clean.srt --sdh sdh.srt
 #    INFO context_format: cues mapped: 115/120, unmatched high-confidence cues: 2
-#    <sfx>[door slams]</sfx>
-#    <c0001 speaker="JOHN">Hello there!</c>
-#    <gap sec="7.50"/>
-#    <c0002 speaker="MARY">I didn't see you come in.</c>
+#    {"success": true, "xml": "<sfx>[door slams]</sfx>\n<c0001 speaker=\"JOHN\">Hello there!</c>\n...", "total_cues": 120, "mapped_cues": 115, "unmatched_cues": 2}
 #
 # Exit codes / 退出码:
 #    0    normal completion / 正常完成
@@ -54,6 +60,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import itertools
+import json
 import logging
 import re
 import sys
@@ -62,8 +69,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from srt_parse import Cue, parse  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from srt_parse import Cue, parse, parse_content  # noqa: E402
 
 logger = logging.getLogger("context_format")
 
@@ -247,7 +254,7 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
     )
 
     logger.info("cues mapped: %d/%d, unmatched high-confidence cues: %d", len(mapped_cues), len(clean_cues), unmatched)
-    return dialogue_clean, speaker_map, manner_map, total_segs_map
+    return dialogue_clean, speaker_map, manner_map, total_segs_map, len(mapped_cues), unmatched
 
 
 
@@ -281,6 +288,14 @@ def _wrap(cue: Cue, seg_speakers: dict[int, str], manner: str | None, total_segs
     return f"<c{cue.index:0{width}d}{attr_str}>{text}</c>"
 
 
+@dataclass
+class BuildResult:
+    xml: str
+    total_cues: int
+    mapped_cues: int
+    unmatched_cues: int
+
+
 def build(
     clean_cues: list[Cue],
     sdh_cues: list[Cue] | None,
@@ -288,9 +303,11 @@ def build(
     min_anchor_words: int = 4,
     min_block: int = 2,
     edge_keep: int = 3,
-) -> str:
+) -> BuildResult:
     entries = extract_entries(sdh_cues or [])
-    dialogue_clean, speaker_map, manner_map, total_segs_map = _match_anchors(clean_cues, entries, min_anchor_words, min_block)
+    dialogue_clean, speaker_map, manner_map, total_segs_map, mapped_count, unmatched = _match_anchors(
+        clean_cues, entries, min_anchor_words, min_block
+    )
     
     sdh_axis, clean_axis = _anchor_axes(dialogue_clean, entries, clean_cues)
     clean_starts, sfx_by_target = [c.start for c in clean_cues], defaultdict(list)
@@ -318,13 +335,27 @@ def build(
         "clean cues: %d, cues with speaker hint: %d, sfx slots: %d",
         len(clean_cues), len(speaker_map), len(sfx_by_target),
     )
-    return "\n".join(lines)
+    return BuildResult(
+        xml="\n".join(lines),
+        total_cues=len(clean_cues),
+        mapped_cues=mapped_count,
+        unmatched_cues=unmatched,
+    )
+
+
+def _load_inputs(source: str | None, sdh: str | None) -> tuple[list[Cue], list[Cue] | None]:
+    if source:
+        return parse(source), (parse(sdh) if sdh else None)
+    payload = json.loads(sys.stdin.read())
+    clean_cues = parse_content(payload["source"])
+    sdh_cues = parse_content(payload["sdh"]) if payload.get("sdh") else None
+    return clean_cues, sdh_cues
 
 
 def main() -> None:
     import os
     parser = argparse.ArgumentParser(description="clean+SDH srt to analysis-stage XML")
-    parser.add_argument("--source", required=True)
+    parser.add_argument("--source", help="clean SRT file path; omit to read {source, sdh} JSON from stdin")
     parser.add_argument("--sdh")
     parser.add_argument("--gap-threshold", type=float, default=6.0)
     parser.add_argument("--min-anchor-words", type=int, default=4)
@@ -337,19 +368,25 @@ def main() -> None:
     log_level = logging.DEBUG if args.debug or os.getenv("DEBUG") == "1" else logging.INFO
     logging.basicConfig(level=log_level, format="%(levelname)s %(name)s: %(message)s")
 
-    clean_cues = parse(args.source)
-    sdh_cues = parse(args.sdh) if args.sdh else None
+    clean_cues, sdh_cues = _load_inputs(args.source, args.sdh)
     result = build(
         clean_cues, sdh_cues,
         args.gap_threshold, args.min_anchor_words, args.min_block, args.edge_keep,
     )
+    payload = json.dumps({
+        "success": bool(result.xml),
+        "xml": result.xml,
+        "total_cues": result.total_cues,
+        "mapped_cues": result.mapped_cues,
+        "unmatched_cues": result.unmatched_cues,
+    }, ensure_ascii=False)
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
-            f.write(result)
+            f.write(payload)
         logger.info("written to %s", args.output)
     else:
-        print(result)
+        print(payload)
 
 
 if __name__ == "__main__":
