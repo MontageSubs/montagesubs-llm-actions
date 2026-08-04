@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.1
+# Version: 1.2.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -157,41 +157,57 @@ def extract_entries(sdh_cues: list[Cue]) -> list[SdhEntry]:
     return entries
 
 
-def _word_stream(items: list, text_of) -> tuple[list[str], list[int]]:
-    tokens, owner = [], []
-    for idx, item in enumerate(items):
-        words = normalize(text_of(item)).split()
-        tokens.extend(words)
-        owner.extend([idx] * len(words))
-    return tokens, owner
+def _get_segments(text: str) -> list[str]:
+    clean_txt = strip_tags(text)
+    segs = [
+        DASH_PREFIX.sub("", p).strip()
+        for l in (line.strip() for line in clean_txt.split("\n") if line.strip())
+        for p in (re.split(r"\s+-", l) if l.startswith("-") else [l])
+        if p.strip()
+    ]
+    return segs or [clean_txt]
 
 
 def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: int, min_block: int):
     dpos = [i for i, e in enumerate(entries) if e.kind == "dialogue"]
-    clean_tokens, clean_owner = _word_stream(clean_cues, lambda c: c.text)
-    sdh_tokens, sdh_owner = _word_stream([entries[i] for i in dpos], lambda e: e.text)
+    clean_tokens, clean_owner, sdh_tokens, sdh_owner = [], [], [], []
+
+    for ci, cue in enumerate(clean_cues):
+        segs = _get_segments(cue.text)
+        for s_idx, seg in enumerate(segs, 1):
+            words = normalize(seg).split()
+            clean_tokens.extend(words)
+            clean_owner.extend([(ci, s_idx, len(segs))] * len(words))
+
+    for pos in dpos:
+        words = normalize(entries[pos].text).split()
+        sdh_tokens.extend(words)
+        sdh_owner.extend([pos] * len(words))
 
     matcher = SequenceMatcher(None, clean_tokens, sdh_tokens, autojunk=True)
-    dialogue_clean: dict[int, int] = {}
-    mapped_cues: set[int] = set()
+    dialogue_clean, total_segs_map, speaker_map = {}, {}, defaultdict(dict)
+    mapped_cues = set()
+
     for block in matcher.get_matching_blocks():
-        if block.size < min_block:
-            continue
+        if block.size < min_block: continue
         for offset in range(block.size):
-            ci = clean_owner[block.a + offset]
-            pos = dpos[sdh_owner[block.b + offset]]
+            ci, s_idx, t_segs = clean_owner[block.a + offset]
+            pos = sdh_owner[block.b + offset]
             dialogue_clean[pos] = ci
             mapped_cues.add(ci)
+            total_segs_map[ci] = t_segs
+            if entries[pos].speaker:
+                speaker_map[ci][s_idx] = entries[pos].speaker
 
-    unmatched = 0
-    for ci, cue in enumerate(clean_cues):
-        if ci in mapped_cues or len(normalize(cue.text).split()) < min_words:
-            continue
-        unmatched += 1
-        logger.warning("no anchor for cue %d: %r", cue.index, cue.text)
+    unmatched = sum(
+        1 for ci, cue in enumerate(clean_cues)
+        if ci not in mapped_cues and len(normalize(cue.text).split()) >= min_words
+        and not logger.warning("no anchor for cue %d: %r", cue.index, cue.text)
+    )
 
     logger.info("cues mapped: %d/%d, unmatched high-confidence cues: %d", len(mapped_cues), len(clean_cues), unmatched)
-    return dialogue_clean
+    return dialogue_clean, speaker_map, total_segs_map
+
 
 
 def _anchor_axes(dialogue_clean: dict[int, int], entries: list[SdhEntry], clean_cues: list[Cue]) -> tuple[list[int], list[int]]:
@@ -215,10 +231,11 @@ def _collapse_sfx(items: list[str], edge_keep: int) -> str:
     return "; ".join(deduped)
 
 
-def _wrap(cue: Cue, speaker: str | None, width: int = 4) -> str:
-    attr = f' speaker="{speaker}"' if speaker else ""
+def _wrap(cue: Cue, seg_speakers: dict[int, str], total_segs: int, width: int = 4) -> str:
+    attrs = [f's="{seg_speakers[1]}"'] if total_segs <= 1 and 1 in seg_speakers else [f's{k}="{v}"' for k, v in sorted(seg_speakers.items())]
+    attr_str = "".join(f" {a}" for a in attrs)
     text = strip_tags(cue.text.replace("\n", " "))
-    return f"<c{cue.index:0{width}d}{attr}>{text}</c>"
+    return f"<c{cue.index:0{width}d}{attr_str}>{text}</c>"
 
 
 def build(
@@ -230,40 +247,30 @@ def build(
     edge_keep: int = 3,
 ) -> str:
     entries = extract_entries(sdh_cues or [])
-    dialogue_clean = _match_anchors(clean_cues, entries, min_anchor_words, min_block)
-    gap_threshold_ms = round(gap_threshold * 1000)
-
-    speaker_by_ci: dict[int, str] = {}
-    for pos, ci in dialogue_clean.items():
-        if entries[pos].speaker:
-            speaker_by_ci[ci] = entries[pos].speaker
-
+    dialogue_clean, speaker_map, total_segs_map = _match_anchors(clean_cues, entries, min_anchor_words, min_block)
+    
     sdh_axis, clean_axis = _anchor_axes(dialogue_clean, entries, clean_cues)
-    clean_starts = [c.start for c in clean_cues]
-
-    sfx_by_target: dict[int, list[str]] = defaultdict(list)
-    for entry in entries:
-        if entry.kind != "sfx":
-            continue
+    clean_starts, sfx_by_target = [c.start for c in clean_cues], defaultdict(list)
+    
+    for entry in (e for e in entries if e.kind == "sfx"):
         target = _project(entry.time, sdh_axis, clean_axis)
         ci = min(bisect.bisect_right(clean_starts, target), len(clean_cues) - 1) if target is not None else len(clean_cues) - 1
         sfx_by_target[ci].append(entry.text)
 
     lines, last_end = [], None
     for ci, cue in enumerate(clean_cues):
-        if last_end is not None:
-            gap_ms = cue.start - last_end
-            if gap_ms > gap_threshold_ms:
-                lines.append(f'<gap sec="{gap_ms / 1000:.2f}"/>')
-        merged = _collapse_sfx(sfx_by_target.get(ci, []), edge_keep)
-        if merged:
+        if last_end is not None and (gap := cue.start - last_end) > gap_threshold * 1000:
+            lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
+        if merged := _collapse_sfx(sfx_by_target.get(ci, []), edge_keep):
             lines.append(f"<sfx>{merged}</sfx>")
-        lines.append(_wrap(cue, speaker_by_ci.get(ci)))
+        
+        t_segs = total_segs_map.get(ci) or len(_get_segments(cue.text))
+        lines.append(_wrap(cue, speaker_map.get(ci, {}), t_segs))
         last_end = cue.end
 
     logger.info(
         "clean cues: %d, cues with speaker hint: %d, sfx slots: %d",
-        len(clean_cues), len(speaker_by_ci), len(sfx_by_target),
+        len(clean_cues), len(speaker_map), len(sfx_by_target),
     )
     return "\n".join(lines)
 
