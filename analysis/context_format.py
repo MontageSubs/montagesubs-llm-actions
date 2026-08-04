@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.5.0
+# Version: 1.6.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -17,13 +17,13 @@
 #    并输出用于分析阶段的自定义 XML 流。
 #
 # Usage / 用法:
-#    python context_format.py --clean clean.srt --sdh sdh.srt
-#    python context_format.py --clean clean.srt --sdh sdh.srt -o result.xml
+#    python context_format.py --source clean.srt --sdh sdh.srt
+#    python context_format.py --source clean.srt --sdh sdh.srt -o result.xml
 #
-#    Required: --clean (Path to clean SRT). 
+#    Required: --source (Path to clean SRT). 
 #    Optional: --sdh (Path to SDH SRT), -o (Output file), 
 #    --gap-threshold (Seconds to trigger <gap> tag).
-#    必须参数：--clean（纯净版 SRT 路径）。
+#    必须参数：--source（纯净 SRT 路径）。
 #    可选参数：--sdh（SDH 版 SRT 路径）、-o（输出文件）、
 #    --gap-threshold（触发 <gap> 标签的时间间隔秒数）。
 #
@@ -38,7 +38,7 @@
 #      - <gap sec="..."/>：超过阈值的时间间隔。
 #
 # Example execution / 执行示例:
-#    $ python context_format.py --clean clean.srt --sdh sdh.srt
+#    $ python context_format.py --source clean.srt --sdh sdh.srt
 #    INFO context_format: cues mapped: 115/120, unmatched high-confidence cues: 2
 #    <sfx>[door slams]</sfx>
 #    <c0001 speaker="JOHN">Hello there!</c>
@@ -243,7 +243,7 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
     unmatched = sum(
         1 for ci, cue in enumerate(clean_cues)
         if ci not in mapped_cues and len(normalize(cue.text).split()) >= min_words
-        and not logger.warning("no anchor for cue %d: %r", cue.index, cue.text)
+        and not (entries and logger.debug("no anchor for cue %d: %r", cue.index, cue.text))
     )
 
     logger.info("cues mapped: %d/%d, unmatched high-confidence cues: %d", len(mapped_cues), len(clean_cues), unmatched)
@@ -302,20 +302,14 @@ def build(
 
     lines, last_end = [], None
     for ci, cue in enumerate(clean_cues):
-        sfx_items = sfx_by_target.get(ci, [])
-        if sfx_items:
-            first_tgt = sfx_items[0][0] if sfx_items[0][0] is not None else cue.start
-            if last_end is not None and (gap := first_tgt - last_end) > gap_threshold * 1000:
-                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
-            if merged := _collapse_sfx([t for _, t in sfx_items], edge_keep):
-                lines.append(f"<sfx>{merged}</sfx>")
-            last_tgt = sfx_items[-1][0] if sfx_items[-1][0] is not None else cue.start
-            if (gap := cue.start - last_tgt) > gap_threshold * 1000:
-                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
-        else:
-            if last_end is not None and (gap := cue.start - last_end) > gap_threshold * 1000:
-                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
-        
+        sfx = _collapse_sfx([t for _, t in sfx_by_target.get(ci, [])], edge_keep).replace('"', '&quot;')
+
+        if last_end is not None and (gap := cue.start - last_end) > gap_threshold * 1000:
+            sfx_attr = f' sfx="{sfx}"' if sfx else ""
+            lines.append(f'<gap sec="{gap / 1000:.2f}"{sfx_attr}/>')
+        elif sfx:
+            lines.append(f"<sfx>{sfx}</sfx>")
+
         t_segs = total_segs_map.get(ci) or len(_get_segments(cue.text))
         lines.append(_wrap(cue, speaker_map.get(ci, {}), manner_map.get(ci), t_segs))
         last_end = cue.end
@@ -328,18 +322,22 @@ def build(
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    import os
     parser = argparse.ArgumentParser(description="clean+SDH srt to analysis-stage XML")
-    parser.add_argument("--clean", required=True)
+    parser.add_argument("--source", required=True)
     parser.add_argument("--sdh")
     parser.add_argument("--gap-threshold", type=float, default=6.0)
     parser.add_argument("--min-anchor-words", type=int, default=4)
     parser.add_argument("--min-block", type=int, default=2)
     parser.add_argument("--edge-keep", type=int, default=3)
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("-o", "--output")
     args = parser.parse_args()
 
-    clean_cues = parse(args.clean)
+    log_level = logging.DEBUG if args.debug or os.getenv("DEBUG") == "1" else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s %(name)s: %(message)s")
+
+    clean_cues = parse(args.source)
     sdh_cues = parse(args.sdh) if args.sdh else None
     result = build(
         clean_cues, sdh_cues,
