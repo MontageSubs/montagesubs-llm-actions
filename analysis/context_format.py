@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.2.0
+# Version: 1.3.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -159,12 +159,12 @@ def extract_entries(sdh_cues: list[Cue]) -> list[SdhEntry]:
 
 def _get_segments(text: str) -> list[str]:
     clean_txt = strip_tags(text)
-    segs = [
-        DASH_PREFIX.sub("", p).strip()
-        for l in (line.strip() for line in clean_txt.split("\n") if line.strip())
-        for p in (re.split(r"\s+-", l) if l.startswith("-") else [l])
-        if p.strip()
-    ]
+    segs = []
+    for l in (line.strip() for line in clean_txt.split("\n") if line.strip()):
+        if l.startswith("-"):
+            segs.extend(DASH_PREFIX.sub("", p).strip() for p in re.split(r"\s+-", l) if p.strip())
+        else:
+            segs.append(l)
     return segs or [clean_txt]
 
 
@@ -255,14 +255,23 @@ def build(
     for entry in (e for e in entries if e.kind == "sfx"):
         target = _project(entry.time, sdh_axis, clean_axis)
         ci = min(bisect.bisect_right(clean_starts, target), len(clean_cues) - 1) if target is not None else len(clean_cues) - 1
-        sfx_by_target[ci].append(entry.text)
+        sfx_by_target[ci].append((target, entry.text))
 
     lines, last_end = [], None
     for ci, cue in enumerate(clean_cues):
-        if last_end is not None and (gap := cue.start - last_end) > gap_threshold * 1000:
-            lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
-        if merged := _collapse_sfx(sfx_by_target.get(ci, []), edge_keep):
-            lines.append(f"<sfx>{merged}</sfx>")
+        sfx_items = sfx_by_target.get(ci, [])
+        if sfx_items:
+            first_tgt = sfx_items[0][0] if sfx_items[0][0] is not None else cue.start
+            if last_end is not None and (gap := first_tgt - last_end) > gap_threshold * 1000:
+                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
+            if merged := _collapse_sfx([t for _, t in sfx_items], edge_keep):
+                lines.append(f"<sfx>{merged}</sfx>")
+            last_tgt = sfx_items[-1][0] if sfx_items[-1][0] is not None else cue.start
+            if (gap := cue.start - last_tgt) > gap_threshold * 1000:
+                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
+        else:
+            if last_end is not None and (gap := cue.start - last_end) > gap_threshold * 1000:
+                lines.append(f'<gap sec="{gap / 1000:.2f}"/>')
         
         t_segs = total_segs_map.get(ci) or len(_get_segments(cue.text))
         lines.append(_wrap(cue, speaker_map.get(ci, {}), t_segs))
