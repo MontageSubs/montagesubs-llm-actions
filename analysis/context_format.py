@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: context_format.py
-# Version: 1.0
+# Version: 1.1
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -52,6 +52,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import itertools
 import logging
 import re
@@ -85,6 +86,7 @@ NARRATOR_PUNCT = set("!?¿¡")
 class SdhEntry:
     kind: str
     text: str
+    time: int
     speaker: str | None = None
 
 
@@ -128,19 +130,19 @@ def _is_narrator_prefix(pre: str) -> bool:
     return not NARRATOR_PUNCT.intersection(pre)
 
 
-def _classify(line: str) -> SdhEntry:
+def _classify(line: str, time: int) -> SdhEntry:
     close = BRACKET_PAIRS.get(line[:1])
     if close and line.endswith(close) and len(line) > 2:
-        return SdhEntry("sfx", line[1:-1].strip())
+        return SdhEntry("sfx", line[1:-1].strip(), time)
     if line[:1] == "?" and line.endswith("?") and len(line) > 2:
-        return SdhEntry("sfx", line[1:-1].strip())
+        return SdhEntry("sfx", line[1:-1].strip(), time)
     speaker = SPEAKER_LINE.match(line)
     if speaker and _is_narrator_prefix(speaker.group(1)):
         residual = speaker.group(2).strip()
         if residual:
-            return SdhEntry("dialogue", residual, speaker.group(1).strip())
-        return SdhEntry("sfx", "")
-    return SdhEntry("dialogue", line)
+            return SdhEntry("dialogue", residual, time, speaker.group(1).strip())
+        return SdhEntry("sfx", "", time)
+    return SdhEntry("dialogue", line, time)
 
 
 def extract_entries(sdh_cues: list[Cue]) -> list[SdhEntry]:
@@ -149,7 +151,7 @@ def extract_entries(sdh_cues: list[Cue]) -> list[SdhEntry]:
         lines = [_strip_line(raw) for raw in cue.text.split("\n")]
         lines = [line for line in lines if line]
         for line in _merge_bracket_continuations(lines):
-            entry = _classify(line)
+            entry = _classify(line, cue.start)
             if entry.text:
                 entries.append(entry)
     return entries
@@ -192,6 +194,20 @@ def _match_anchors(clean_cues: list[Cue], entries: list[SdhEntry], min_words: in
     return dialogue_clean
 
 
+def _anchor_axes(dialogue_clean: dict[int, int], entries: list[SdhEntry], clean_cues: list[Cue]) -> tuple[list[int], list[int]]:
+    pairs = sorted((entries[pos].time, clean_cues[ci].start) for pos, ci in dialogue_clean.items())
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _project(time: int, sdh_axis: list[int], clean_axis: list[int]) -> int | None:
+    if not sdh_axis:
+        return None
+    i = min(bisect.bisect_left(sdh_axis, time), len(sdh_axis) - 1)
+    if i > 0 and abs(time - sdh_axis[i - 1]) <= abs(sdh_axis[i] - time):
+        i -= 1
+    return clean_axis[i] + (time - sdh_axis[i])
+
+
 def _collapse_sfx(items: list[str], edge_keep: int) -> str:
     deduped = [text for text, _ in itertools.groupby(items)]
     if len(deduped) > edge_keep * 2:
@@ -222,17 +238,16 @@ def build(
         if entries[pos].speaker:
             speaker_by_ci[ci] = entries[pos].speaker
 
-    next_clean: list[int | None] = [None] * len(entries)
-    current = None
-    for pos in reversed(range(len(entries))):
-        if entries[pos].kind == "dialogue" and pos in dialogue_clean:
-            current = dialogue_clean[pos]
-        next_clean[pos] = current
+    sdh_axis, clean_axis = _anchor_axes(dialogue_clean, entries, clean_cues)
+    clean_starts = [c.start for c in clean_cues]
 
-    sfx_by_target: dict[int | None, list[str]] = defaultdict(list)
-    for pos, entry in enumerate(entries):
-        if entry.kind == "sfx":
-            sfx_by_target[next_clean[pos]].append(entry.text)
+    sfx_by_target: dict[int, list[str]] = defaultdict(list)
+    for entry in entries:
+        if entry.kind != "sfx":
+            continue
+        target = _project(entry.time, sdh_axis, clean_axis)
+        ci = min(bisect.bisect_right(clean_starts, target), len(clean_cues) - 1) if target is not None else len(clean_cues) - 1
+        sfx_by_target[ci].append(entry.text)
 
     lines, last_end = [], None
     for ci, cue in enumerate(clean_cues):
@@ -246,13 +261,9 @@ def build(
         lines.append(_wrap(cue, speaker_by_ci.get(ci)))
         last_end = cue.end
 
-    trailing = _collapse_sfx(sfx_by_target.get(None, []), edge_keep)
-    if trailing:
-        lines.append(f"<sfx>{trailing}</sfx>")
-
     logger.info(
         "clean cues: %d, cues with speaker hint: %d, sfx slots: %d",
-        len(clean_cues), len(speaker_by_ci), sum(1 for k in sfx_by_target if k is not None),
+        len(clean_cues), len(speaker_by_ci), len(sfx_by_target),
     )
     return "\n".join(lines)
 
