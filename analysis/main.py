@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # ============================================================================
 # Name: main.py
-# Version: 1.0.0
+# Version: 1.1.0
 # Organization: MontageSubs (蒙太奇字幕社区)
 # Contributors: Meow P (小p)
 # License: MIT License
@@ -420,7 +420,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--round", type=int, default=1, help="round index to assemble; use >1 with --history to test continuation rounds")
     parser.add_argument("--history", type=Path, default=None, help="JSON array of prior-round LLMResponse objects, required when --round > 1")
     parser.add_argument("--correlation-id", default=None, help="override generated correlation id, useful for reproducible test runs")
-    parser.add_argument("--template", type=Path, default=Path(__file__).resolve().parent / "ANALYSIS.md")
+    parser.add_argument("--template", type=Path, default=Path(__file__).resolve().parent / "prompt" / "ANALYSIS.md")
     parser.add_argument("--source", type=Path, required=True, help="clean source SRT path")
     parser.add_argument("--sdh", type=Path, default=None, help="optional SDH SRT path")
     parser.add_argument("--synopsis", type=Path, default=None)
